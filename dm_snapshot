@@ -1,0 +1,321 @@
+#!/bin/bash
+#TODO: limit create on device sector amount
+#TODO: Correct calculation ?
+#TODO: Loop until correct device
+#TODO: Minimum size snapshot!
+#--------------------------------------------------------------------------------
+# Some basic checks before we even attemt to start the script
+#--------------------------------------------------------------------------------
+[[ $EUID -ne 0 ]] && error 'This script must be run as root';
+modprobe dm_mod &> /dev/null; [ $? ] || error 'Failed to load the required module';
+# List of all the supported actions with the description
+declare -A function_list && 
+  function_list=( ['create']="Creates a new snapshot on the original device"\
+                  ['remove']="Removes all the devices except the original device" ) ||
+    error 'Failed creating function list (bash version?)';
+
+#--------------------------------------------------------------------------------
+# Color
+#--------------------------------------------------------------------------------
+RED='\e[0;31m';
+COLOR_OFF='\e[0m';
+GREEN='\e[0;32m'
+
+#--------------------------------------------------------------------------------
+# Some printing utility functions
+#--------------------------------------------------------------------------------
+function print_usage {
+  echo -e $GREEN"================================================================================";
+  echo -e "Usage: <action>  <parameters>\n\
+Parameters:\n\
+\t[[!] -a <amount of sectors to be used for the COW, required when creating>]\n\
+\t[-b <absolute path where the devices are located (and will be)\n\t\t(DM_DEV_DIR environment variable not set yet)>]\n\
+\t[-c <the name of the COW-device in de base path>]\n\
+\t!-e <name of the action you want to perform>\n\
+\t[-h <no argument, exits with status 0>]\n\
+\t[-n <name of snapshot-origin in the base path>]\n\
+\t!-o <name of original in the base path>\n\
+\t[-s <name of snapshot location in the base path>]\n\
+\t[-v <no argument, toggles verbose mode>]";
+  actions;
+  echo -e "================================================================================"$COLOR_OFF;
+}
+
+function actions {
+  echo -e "Actions: ";
+  for function in "${!function_list[@]}"; do
+    description="${function_list["$function"]}";
+    echo -e "\t-$function: \"$description\""; 
+  done;
+}
+
+function error {
+  echo -e $RED'[ERROR]'$1', exiting.'$COLOR_OFF 1>&2;
+  exit 1;
+}
+
+function banner {
+  echo -e $GREEN$1$COLOR_OFF;
+}
+
+#--------------------------------------------------------------------------------
+# Parse the flag arguments
+#--------------------------------------------------------------------------------
+while getopts a:b:c:e:hn:o:s:v flag; do
+  case $flag in
+    a)
+      # amount of sectors
+      size=$OPTARG;
+      ;;
+    b)
+      # basepath variable, should set the DM_DEV_DIR environment variable, but isn't supported as of now
+      base_path=$OPTARG;
+      error 'Not yet implemented';
+      ;;
+    c)
+      cow=$OPTARG;
+      error 'This option is not yet supported';
+      ;;
+    e)
+      action=$OPTARG;
+      ;;
+    h)
+      # Help flag [optional]
+      echo "Actions:";
+      print_usage;
+      exit 0;
+      ;;
+    n)
+      # Name of the snapshot-origin device [optional]
+      snapshot_origin=$OPTARG;
+      error "Pls don't";
+      ;;
+    o)
+      # The original device
+      original=$OPTARG;
+      ;;
+    s)
+      # Snapshot device location [optional]
+      snapshot=$OPTARG;
+      error "Pls don't";
+      ;;
+    v)
+      # Activate verbose mode [optional]
+      verbose=1;
+      ;;
+  esac
+done;
+
+#--------------------------------------------------------------------------------
+# Required parameters
+#--------------------------------------------------------------------------------
+[ $action  ] || error 'Can not run without an action';
+[ $original ] || error 'You need to specify a source (original) device';
+[ "$action" == "create" ] && { [ $size ] || error 'You need to specify an amount of sectors for the snapshot COW device'; };
+
+#--------------------------------------------------------------------------------
+# Optional parameters 
+#--------------------------------------------------------------------------------
+[ $base_path ] || base_path=/dev/mapper/;
+[ $cow  ] || cow='dm.'$original'.cow';
+[ $snapshot ] || snapshot='dm.'$original'.snapshot';
+[ $snapshot_origin ] || snapshot_origin='dm.'$original'.snapshot_origin';
+
+#--------------------------------------------------------------------------------
+# Print variables for debugging purposes when verbose
+#--------------------------------------------------------------------------------
+if [ $verbose  ]; then
+  echo -e $GREEN"================================================================================";
+  echo "VARIABLES";
+  echo "================================================================================";
+  echo -e "COW:\t\t\t$cow [$base_path$cow]";
+  echo -e "Snapshot-origin:\t$snapshot_origin [$base_path$snapshot_origin]";
+  echo -e "Original:\t\t$original [$base_path$original]";
+  echo -e "Snapshot:\t\t$snapshot [$base_path$snapshot]";
+  echo -e "Action:\t\t\t$action";
+  echo -e "================================================================================"$COLOR_OFF;
+fi
+
+#--------------------------------------------------------------------------------
+# Device utility functions
+#--------------------------------------------------------------------------------
+function suspend_dev {
+  for device in $@; do
+    echo "Suspend [$device]";
+    dmsetup suspend $base_path$device;
+  done;
+}
+
+function resume_dev {
+  for device in $@; do
+    echo "Resume [$device]";
+    dmsetup resume $base_path$device;
+  done;
+}
+
+function create_dev {
+  for device in $@; do
+    echo "Create [$device]";
+    dmsetup create $1 --notable;
+  done;
+}
+
+function unmount {
+  for device in $@; do
+     mount_point=$( grep "$device" /etc/mtab | awk '{ print $2 }' );
+     [ $mount_point ] && umount $mount_point;
+  done
+}
+
+function device_exists {
+  [ $1 ] || return 1;
+  for device in $@; do
+    [ -b $device ] || return 1;
+  done
+  return 0;
+}
+
+function create_device_hash {
+  [ $1 ] || error 'create_device_hash requires at least one parameter';
+  for device in $@; do
+    leaf=$device; 
+    device_exists $base_path$device;
+      exist=$?;
+      device_list["$leaf"]=$exist;
+  done;
+}
+
+#--------------------------------------------------------------------------------
+# Action functions
+#--------------------------------------------------------------------------------
+function create_dm_snapshot {
+  banner "0: Checking if block devices don't allready exist, original device should exist...";
+  device_exists $base_path$original;
+  [ $? -eq 0 ] || error 'The source (original) device should exist';
+  device_exists $base_path$snapshot_origin $base_path$snapshot $base_path$cow;
+  [ $? -eq 0 ] && error "They allready exist pls use the 'remove' function";
+  echo "Done checking.";
+
+  banner "1: Suspending the original device.";
+  suspend_dev $original || error "Failed suspending original device";
+  
+  banner "2: Creating snapshot-origin.";
+  create_dev $snapshot_origin || error "Failed creating snapshot-origin";
+  
+  banner "3: Read original table into snapshot-origin.";
+  dmsetup table $base_path$original | dmsetup load $base_path$snapshot_origin ||
+    error 'Failed loading original table into snapshot-origin';
+  echo "Done reading.";
+  
+  banner "4: Resume snapshot-origin.";
+  resume_dev $snapshot_origin || error 'Could not resume snapshot-origin';
+  
+  banner "5: Create snapshot device.";
+  create_dev $snapshot || error 'Failed to create snapshot device';
+  
+  banner "6: Create COW-device.";
+  #TODO: Calculate minimum size COW-device!
+  create_dev $cow ;
+  original_table=$( dmsetup table $original);
+  echo $original_table | grep " snapshot ";
+  if [ $? -eq 1 ]; then
+    #TODO: loop until correct device to be able to snapshot 2+ generation (until linear!)
+    target_device=$( echo $original_table | awk '{print $4}' );
+  else
+    banner 'Snapshot detected';
+    major_minor=( $( echo $original_table | awk '{print $4}' | sed 's/^\(.*\):\(.*\)$/\1 \2/' ) );
+    source_device=$( dmsetup info -j ${major_minor[0]} -m ${major_minor[1]} | grep 'Name' | awk '{print $2}' );
+    target_device=$( dmsetup table $source_device | awk '{print $4}' );
+  fi;
+
+  #TODO: check total sector count device
+  last_table=$( dmsetup table | grep "$target_device" | awk '{print $6}' | sort -g | tail -n 1 );
+  begin_sector_args=( $( dmsetup table | grep -E $target_device".*"$last_table"|"$last_table".*"$target_device | awk '{print $2 " " $3 " " $6}' ) );
+  begin_sector=$( expr ${begin_sector_args[1]} - ${begin_sector_args[0]} + ${begin_sector_args[2]} ); #TODO: Correct calculation?
+  table="0 $size linear $target_device $begin_sector";
+  echo $table | dmsetup load $cow;
+  resume_dev $cow;
+  
+  banner "7: Calculate rowcount in snapshot-origin";
+  snapshot_origin_size=$( blockdev --getsz $base_path$snapshot_origin ) ||
+    error 'Could not determine rowcount';
+  echo "Snapshot size: $snapshot_origin_size";
+  
+  banner "8: Load snapshot table.";
+  table="0 $snapshot_origin_size snapshot $base_path$snapshot_origin $base_path$cow p 64";
+  [ $verbose ] && echo "Table: $table";
+  echo $table | dmsetup load $base_path$snapshot || error 'Failed loading snapshot table';
+  echo "Done loading.";
+  
+  banner "9: Reload original device table.";
+  table="0 $snapshot_origin_size snapshot-origin $base_path$snapshot_origin";
+  [ $verbose ] && echo "Table: $table";
+  echo $table | dmsetup load $original || error 'Failed reloading original table';
+  echo "Done reloading.";
+  
+  banner "10: Resume frozen tables.";
+  resume_dev $snapshot $original || error 'Could not resume devices';
+  echo "Done resuming.";
+ 
+  if [ $verbose ]; then
+    echo -e $GREEN"================================================================================";
+    echo "snapshot_origin table: $( dmsetup table $base_path$snapshot_origin )";
+    echo "snapshot_origin size: $snapshot_origin_size(~=$( expr $snapshot_origin_size / 2097152  )G)";
+    echo "snapshot table: $( dmsetup table $base_path$snapshot  )";
+    echo "original device table: $( dmsetup table $base_path$original  )";
+    echo -e "================================================================================"$COLOR_OFF;
+  fi
+}
+
+function remove_dm_snapshot {
+  declare -A device_list || error 'Failed creating device list (bash version?)';
+  create_device_hash $original $snapshot_origin $snapshot $cow;
+
+  banner "1: Unmount all mounted devices.";
+  unmount $snapshot $original;
+  echo "Ummounting done.";
+
+  banner "2: Reset original device and snapshot-origin.";
+  [ ${device_list["$original"]} -eq 0 ] && dmsetup suspend $base_path$original;
+
+  [ ${device_list["$snapshot_origin"]} -eq 0 ] && [ ${device_list["$original"]} ] &&
+    dmsetup table $base_path$snapshot_origin | dmsetup load $base_path$original;
+
+  [ ${device_list["$original"]} -eq 0 ] && dmsetup resume $base_path$original;
+  [ ${device_list["$snapshot"]} -eq 0 ] && dmsetup remove $base_path$snapshot &> /dev/null;
+  echo "Done resetting.";
+ 
+  banner "3: Remove COW-device.";
+  [ ${device_list["$cow"]} -eq 0 ] && dmsetup remove $base_path$cow; 
+  echo "Done removing.";
+  
+  banner "4: Clear and remove snapshot-origin.";
+  # clear: Destroys the table in the inactive table slot for device_name.
+  [ ${device_list["$snapshot_origin"]} -eq 0 ] && dmsetup clear $base_path$snapshot_origin;
+  [ ${device_list["$snapshot_origin"]} -eq 0 ] && dmsetup remove $base_path$snapshot_origin;
+  echo "Done clearing and removing.";
+
+  unset device_list;
+  declare -A device_list || error 'Failed creating device list (bash version?)';
+
+  create_device_hash $snapshot_origin $snapshot $cow;
+  for device in "${!device_list[@]}"; do
+    [ ${device_list["$device"]} -eq 0 ] && echo "This device was not deleted (pls fix): $device |${device_list["$device"]}|";
+  done; 
+}
+
+#--------------------------------------------------------------------------------
+# Choose the specified action
+#--------------------------------------------------------------------------------
+case $action in
+  'create')
+    create_dm_snapshot;
+    ;;
+  'remove')
+    remove_dm_snapshot;
+    ;;
+  *)
+    actions;
+    error 'Unknown action';
+    ;;
+esac;
